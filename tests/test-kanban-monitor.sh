@@ -43,4 +43,34 @@ third="$(KANBAN_DB="$DB" "$MONITOR")"
 [[ "$third" == *'event_max|2'* ]] || { printf 'event cursor did not advance\n' >&2; exit 1; }
 [[ "$third" == *'task|t_ready|running|100||7|0|'* ]] || { printf 'running state missing\n' >&2; exit 1; }
 
+# WAL-mode DB: a readonly open can transiently fail with CANTOPEN while the
+# -shm/-wal sidecars are absent or locked by a concurrent writer. The monitor
+# must still produce a complete snapshot (via retry or copy fallback), exit 0,
+# and never report board_state=missing for a DB that exists.
+cp "$DB" "$TMP/wal.db"
+sqlite3 "$TMP/wal.db" "PRAGMA journal_mode=wal;" >/dev/null
+sqlite3 "$TMP/wal.db" "INSERT INTO task_events(task_id,kind,created_at) VALUES('t_ready','claimed',3);
+UPDATE tasks SET current_run_id=8 WHERE id='t_ready';" >/dev/null
+wal_out="$(KANBAN_DB="$TMP/wal.db" "$MONITOR")"
+[[ "$wal_out" == *'event_max|3'* ]] || { printf 'WAL-mode snapshot missing event cursor\n' >&2; exit 1; }
+[[ "$wal_out" == *'task|t_ready|running|100||8|0|'* ]] || { printf 'WAL-mode snapshot missing running state\n' >&2; exit 1; }
+# A committed WAL write without a checkpoint must still be visible to the
+# fallback path if the readonly open fails.
+rm -f "$TMP/wal.db-shm" "$TMP/wal.db-wal"
+# Recreate a wal sidecar pair by opening rw once; then hide the shm again and
+# make the directory read-only so sqlite cannot recreate it.
+sqlite3 "$TMP/wal.db" "SELECT 1;" >/dev/null
+chmod 555 "$TMP"
+ro_out="$(KANBAN_DB="$TMP/wal.db" "$MONITOR")"
+ro_exit=$?
+chmod 755 "$TMP"
+[[ "$ro_exit" -eq 0 ]] || { printf 'monitor exited non-zero on unreadable dir\n' >&2; exit 1; }
+[[ "$ro_out" == *'task|t_ready|running|100||8|0|'* ]] || { printf 'fallback snapshot incomplete\n' >&2; exit 1; }
+[[ "$ro_out" != *'board_state=unreadable'* ]] || { printf 'fallback should have recovered the snapshot\n' >&2; exit 1; }
+
+# A corrupt/garbage DB file must degrade gracefully, never exit non-zero.
+printf 'not a database at all' > "$TMP/junk.db"
+junk_out="$(KANBAN_DB="$TMP/junk.db" "$MONITOR")" || { printf 'monitor exited non-zero on junk DB\n' >&2; exit 1; }
+[[ "$junk_out" == *'board_state=unreadable'* ]] || { printf 'junk DB should report board_state=unreadable\n' >&2; exit 1; }
+
 printf 'kanban-monitor tests: PASS\n'
